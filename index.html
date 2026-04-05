@@ -28,6 +28,50 @@
   --radius-sm: 10px;
 }
 
+body.light-theme {
+  --bg: #f4f4f8;
+  --surface: #ffffff;
+  --surface2: #f0f0f5;
+  --surface3: #e4e4ec;
+  --text: #0d0d1a;
+  --text2: #555568;
+  --text3: #9999aa;
+  --border: rgba(0,0,0,0.08);
+  --red-dim: rgba(239,68,68,0.08);
+  --accent-dim: rgba(245,197,24,0.15);
+}
+body.light-theme .leaflet-tile { filter: brightness(1.0) saturate(1.0); }
+body.light-theme .leaflet-container { background: #e8e8f0 !important; }
+
+/* THEME TOGGLE */
+.theme-toggle {
+  margin-left: auto;
+  width: 38px; height: 22px;
+  background: var(--surface3);
+  border: 1.5px solid var(--border);
+  border-radius: 11px;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+.theme-toggle-knob {
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  transition: transform 0.2s;
+  font-size: 9px;
+  display: flex; align-items: center; justify-content: center;
+}
+body.light-theme .theme-toggle-knob { transform: translateX(16px); }
+
+/* GEO BUTTON STATES */
+.map-btn.locating { animation: pulse-geo 1s infinite; }
+@keyframes pulse-geo { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.map-btn.located { background: var(--accent); color: #000; }
+
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 html, body {
   height: 100%; background: var(--bg); color: var(--text);
@@ -255,6 +299,9 @@ textarea.input-field { resize: none; height: 70px; padding-top: 13px; font-famil
     <div class="header-title">ЕнакиевоТакси</div>
     <div class="header-sub">Г. Енакиево, ДНР • Круглосуточно</div>
   </div>
+  <div class="theme-toggle" onclick="toggleTheme()" title="Сменить тему">
+    <div class="theme-toggle-knob" id="themeKnob">🌙</div>
+  </div>
 </div>
 
 <div class="tabs">
@@ -326,6 +373,15 @@ textarea.input-field { resize: none; height: 70px; padding-top: 13px; font-famil
         <div class="price-lbl">В пути</div>
         <div class="eta-val" id="etaVal">—</div>
         <div class="price-lbl" style="margin-top:2px;">мин</div>
+      </div>
+    </div>
+
+    <div id="delivery-item-section" style="display:none;">
+      <div class="section-label" style="margin-top:14px;">
+        Что привезти
+      </div>
+      <div class="input-wrap">
+        <textarea class="input-field" id="deliveryItem" placeholder="Опишите что нужно привезти..." style="height:80px;"></textarea>
       </div>
     </div>
 
@@ -544,11 +600,32 @@ function clearRoute() {
 }
 
 function locateMe() {
-  if (!navigator.geolocation) return;
-  navigator.geolocation.getCurrentPosition(p => {
-    reverseGeocode(p.coords.latitude, p.coords.longitude, 'from');
-    map.setView([p.coords.latitude, p.coords.longitude], 15, { animate: true });
-  });
+  if (!navigator.geolocation) {
+    showAlert('Геолокация не поддерживается вашим браузером');
+    return;
+  }
+  const btn = document.querySelector('.map-btn');
+  btn.classList.add('locating');
+  btn.textContent = '⏳';
+
+  navigator.geolocation.getCurrentPosition(
+    p => {
+      btn.classList.remove('locating');
+      btn.classList.add('located');
+      btn.textContent = '✅';
+      setTimeout(() => { btn.classList.remove('located'); btn.textContent = '📍'; }, 2000);
+      reverseGeocode(p.coords.latitude, p.coords.longitude, 'from');
+      map.setView([p.coords.latitude, p.coords.longitude], 16, { animate: true });
+    },
+    err => {
+      btn.classList.remove('locating');
+      btn.textContent = '📍';
+      if (err.code === 1) showAlert('Разрешите доступ к геолокации в браузере');
+      else if (err.code === 2) showAlert('Не удалось определить местоположение');
+      else showAlert('Ошибка геолокации, попробуйте снова');
+    },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+  );
 }
 
 // ===== AUTOCOMPLETE =====
@@ -624,6 +701,7 @@ function selectType(type) {
   document.getElementById('btn-taxi').classList.toggle('active', type === 'taxi');
   document.getElementById('btn-delivery').classList.toggle('active', type === 'delivery');
   document.getElementById('submitIcon').textContent = type === 'taxi' ? '🚕' : '📦';
+  document.getElementById('delivery-item-section').style.display = type === 'delivery' ? 'block' : 'none';
   if (calcDist > 0) applyRoute(calcDist, calcEta);
 }
 
@@ -661,6 +739,7 @@ function getOrderData() {
     distance:     parseFloat(calcDist.toFixed(2)),
     price:        calcPrice,
     comment:      document.getElementById('comment').value.trim(),
+    delivery_item: document.getElementById('deliveryItem').value.trim(),
     from_lat:     mFrom ? mFrom.getLatLng().lat : null,
     from_lon:     mFrom ? mFrom.getLatLng().lng : null
   };
@@ -755,6 +834,21 @@ function setupMainButton() {
 }
 
 setupMainButton();
+
+// ===== THEME =====
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light-theme');
+  document.getElementById('themeKnob').textContent = isLight ? '☀️' : '🌙';
+  try { localStorage.setItem('taxi_theme', isLight ? 'light' : 'dark'); } catch(e) {}
+}
+
+// Restore saved theme
+try {
+  if (localStorage.getItem('taxi_theme') === 'light') {
+    document.body.classList.add('light-theme');
+    document.getElementById('themeKnob').textContent = '☀️';
+  }
+} catch(e) {}
 
 function showAlert(msg) {
   const el = document.getElementById('formAlert');
