@@ -754,17 +754,27 @@ function validateForm() {
 }
 
 async function doSend() {
-  if (!tg) {
-    showAlert('Откройте через кнопку в боте');
-    resetBtn();
-    return;
+  // Пробуем получить user_id из Telegram WebApp
+  let userId = tg?.initDataUnsafe?.user?.id;
+
+  // Если не получили (web.telegram.org или старый клиент) — пробуем из initData
+  if (!userId && tg?.initData) {
+    try {
+      const params = new URLSearchParams(tg.initData);
+      const userStr = params.get('user');
+      if (userStr) userId = JSON.parse(decodeURIComponent(userStr)).id;
+    } catch(e) {}
   }
 
-  const userId = tg.initDataUnsafe?.user?.id;
   if (!userId) {
-    showAlert('Не удалось получить ID пользователя. Откройте через бота.');
-    resetBtn();
-    return;
+    // Показываем форму ввода ID для web.telegram.org
+    const input = prompt('Введите ваш Telegram ID (узнайте у @userinfobot):');
+    if (!input || isNaN(parseInt(input))) {
+      showAlert('Откройте через мобильное приложение Telegram для лучшей работы');
+      resetBtn();
+      return;
+    }
+    userId = parseInt(input);
   }
 
   try {
@@ -776,8 +786,8 @@ async function doSend() {
 
     const result = await res.json();
     if (result.ok) {
-      // Успех — закрываем WebApp
-      tg.close();
+      showAlert('✅ Заказ отправлен! Проверьте Telegram.');
+      setTimeout(() => { if (tg) tg.close(); }, 1500);
     } else {
       showAlert('Ошибка: ' + (result.error || 'попробуйте снова'));
       resetBtn();
