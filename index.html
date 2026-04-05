@@ -756,33 +756,17 @@ function validateForm() {
 }
 
 async function doSend() {
-  // Пробуем получить user_id из Telegram WebApp
-  let userId = tg?.initDataUnsafe?.user?.id;
-
-  // Если не получили — пробуем из initData
-  if (!userId && tg?.initData) {
-    try {
-      const params = new URLSearchParams(tg.initData);
-      const userStr = params.get('user');
-      if (userStr) userId = JSON.parse(decodeURIComponent(userStr)).id;
-    } catch(e) {}
+  if (!tg) {
+    showAlert('Откройте через кнопку в боте');
+    resetBtn();
+    return;
   }
 
-  // Если открыто как сайт (не через Telegram) — просим ввести ID
+  const userId = tg.initDataUnsafe?.user?.id;
   if (!userId) {
-    const stored = localStorage.getItem('taxi_user_id');
-    if (stored) {
-      userId = parseInt(stored);
-    } else {
-      const input = prompt('Введите ваш Telegram ID:\n(узнайте у @userinfobot в Telegram)');
-      if (!input || isNaN(parseInt(input))) {
-        showAlert('Введите корректный Telegram ID');
-        resetBtn();
-        return;
-      }
-      userId = parseInt(input);
-      try { localStorage.setItem('taxi_user_id', userId); } catch(e) {}
-    }
+    showAlert('Не удалось получить ID. Откройте через мобильный Telegram.');
+    resetBtn();
+    return;
   }
 
   try {
@@ -794,8 +778,7 @@ async function doSend() {
 
     const result = await res.json();
     if (result.ok) {
-      showAlert('✅ Заказ отправлен! Проверьте Telegram.');
-      setTimeout(() => { if (tg) tg.close(); }, 1500);
+      tg.close();
     } else {
       showAlert('Ошибка: ' + (result.error || 'попробуйте снова'));
       resetBtn();
