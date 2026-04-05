@@ -466,12 +466,14 @@ const isTelegram = !!tg;
 
 if (tg) { tg.expand(); tg.ready(); }
 
-if (tg && tg.colorScheme === 'light') {
-  const s = document.documentElement.style;
-  s.setProperty('--bg','#f2f2f7'); s.setProperty('--surface','#ffffff');
-  s.setProperty('--surface2','#f8f8fc'); s.setProperty('--surface3','#ededf2');
-  s.setProperty('--text','#111118'); s.setProperty('--text2','#666672');
-  s.setProperty('--text3','#a0a0b0'); s.setProperty('--border','rgba(0,0,0,0.08)');
+// Синхронизируем тему с Telegram при первом открытии (только если нет сохранённой)
+if (tg) {
+  try {
+    const saved = localStorage.getItem('taxi_theme');
+    if (!saved && tg.colorScheme === 'light') {
+      document.body.classList.add('light-theme');
+    }
+  } catch(e) {}
 }
 
 // ===== MAP =====
@@ -757,7 +759,7 @@ async function doSend() {
   // Пробуем получить user_id из Telegram WebApp
   let userId = tg?.initDataUnsafe?.user?.id;
 
-  // Если не получили (web.telegram.org или старый клиент) — пробуем из initData
+  // Если не получили — пробуем из initData
   if (!userId && tg?.initData) {
     try {
       const params = new URLSearchParams(tg.initData);
@@ -766,15 +768,21 @@ async function doSend() {
     } catch(e) {}
   }
 
+  // Если открыто как сайт (не через Telegram) — просим ввести ID
   if (!userId) {
-    // Показываем форму ввода ID для web.telegram.org
-    const input = prompt('Введите ваш Telegram ID (узнайте у @userinfobot):');
-    if (!input || isNaN(parseInt(input))) {
-      showAlert('Откройте через мобильное приложение Telegram для лучшей работы');
-      resetBtn();
-      return;
+    const stored = localStorage.getItem('taxi_user_id');
+    if (stored) {
+      userId = parseInt(stored);
+    } else {
+      const input = prompt('Введите ваш Telegram ID:\n(узнайте у @userinfobot в Telegram)');
+      if (!input || isNaN(parseInt(input))) {
+        showAlert('Введите корректный Telegram ID');
+        resetBtn();
+        return;
+      }
+      userId = parseInt(input);
+      try { localStorage.setItem('taxi_user_id', userId); } catch(e) {}
     }
-    userId = parseInt(input);
   }
 
   try {
@@ -846,19 +854,49 @@ function setupMainButton() {
 setupMainButton();
 
 // ===== THEME =====
+function applyTheme(isLight) {
+  const root = document.documentElement;
+  if (isLight) {
+    document.body.classList.add('light-theme');
+    root.style.setProperty('--bg','#f4f4f8');
+    root.style.setProperty('--surface','#ffffff');
+    root.style.setProperty('--surface2','#f0f0f5');
+    root.style.setProperty('--surface3','#e4e4ec');
+    root.style.setProperty('--text','#0d0d1a');
+    root.style.setProperty('--text2','#555568');
+    root.style.setProperty('--text3','#9999aa');
+    root.style.setProperty('--border','rgba(0,0,0,0.08)');
+    root.style.setProperty('--red-dim','rgba(239,68,68,0.08)');
+    root.style.setProperty('--accent-dim','rgba(245,197,24,0.15)');
+    document.getElementById('themeKnob').textContent = '☀️';
+  } else {
+    document.body.classList.remove('light-theme');
+    root.style.setProperty('--bg','#0d0d0f');
+    root.style.setProperty('--surface','#16161a');
+    root.style.setProperty('--surface2','#1e1e24');
+    root.style.setProperty('--surface3','#252530');
+    root.style.setProperty('--text','#f0f0f5');
+    root.style.setProperty('--text2','#8b8b9a');
+    root.style.setProperty('--text3','#525260');
+    root.style.setProperty('--border','rgba(255,255,255,0.07)');
+    root.style.setProperty('--red-dim','rgba(239,68,68,0.12)');
+    root.style.setProperty('--accent-dim','rgba(245,197,24,0.12)');
+    document.getElementById('themeKnob').textContent = '🌙';
+  }
+}
+
 function toggleTheme() {
-  const isLight = document.body.classList.toggle('light-theme');
-  document.getElementById('themeKnob').textContent = isLight ? '☀️' : '🌙';
+  const isLight = !document.body.classList.contains('light-theme');
+  applyTheme(isLight);
   try { localStorage.setItem('taxi_theme', isLight ? 'light' : 'dark'); } catch(e) {}
 }
 
 // Restore saved theme
 try {
-  if (localStorage.getItem('taxi_theme') === 'light') {
-    document.body.classList.add('light-theme');
-    document.getElementById('themeKnob').textContent = '☀️';
-  }
-} catch(e) {}
+  const saved = localStorage.getItem('taxi_theme');
+  if (saved === 'light') applyTheme(true);
+  else applyTheme(false);
+} catch(e) { applyTheme(false); }
 
 function showAlert(msg) {
   const el = document.getElementById('formAlert');
