@@ -425,6 +425,7 @@ async def process_order_data(message: Message, raw: str, bot: Bot):
     distance     = float(data.get("distance", 0))
     price        = float(data.get("price",    0))
     comment      = data.get("comment", "").strip()
+    delivery_item = data.get("delivery_item", "").strip()
     from_lat     = data.get("from_lat")
     from_lon     = data.get("from_lon")
     if from_lat is not None: from_lat = float(from_lat)
@@ -438,6 +439,11 @@ async def process_order_data(message: Message, raw: str, bot: Bot):
 
     if price <= 0:
         price = calc_price(distance, order_type)
+
+    # Добавляем "что привезти" к комментарию для доставки
+    if order_type == "delivery" and delivery_item:
+        comment = f"📦 Что привезти: {delivery_item}" + (f"
+Комментарий: {comment}" if comment else "")
 
     oid = create_order(
         passenger_id=message.from_user.id, order_type=order_type,
@@ -1010,6 +1016,7 @@ async def handle_order(request: web.Request) -> web.Response:
     distance     = float(data.get("distance", 0))
     price        = float(data.get("price",    0))
     comment      = data.get("comment", "").strip()
+    delivery_item = data.get("delivery_item", "").strip()
     from_lat     = data.get("from_lat")
     from_lon     = data.get("from_lon")
     if from_lat is not None: from_lat = float(from_lat)
@@ -1020,6 +1027,11 @@ async def handle_order(request: web.Request) -> web.Response:
 
     if price <= 0:
         price = calc_price(distance, order_type)
+
+    # Добавляем "что привезти" к комментарию для доставки
+    if order_type == "delivery" and delivery_item:
+        comment = f"📦 Что привезти: {delivery_item}" + (f"
+Комментарий: {comment}" if comment else "")
 
     oid = create_order(
         passenger_id=user_id, order_type=order_type,
