@@ -442,8 +442,7 @@ async def process_order_data(message: Message, raw: str, bot: Bot):
 
     # Добавляем "что привезти" к комментарию для доставки
     if order_type == "delivery" and delivery_item:
-        comment = f"📦 Что привезти: {delivery_item}" + (f"
-Комментарий: {comment}" if comment else "")
+        comment = f"📦 Что привезти: {delivery_item}" + (f"\nКомментарий: {comment}" if comment else "")
 
     oid = create_order(
         passenger_id=message.from_user.id, order_type=order_type,
@@ -1030,8 +1029,7 @@ async def handle_order(request: web.Request) -> web.Response:
 
     # Добавляем "что привезти" к комментарию для доставки
     if order_type == "delivery" and delivery_item:
-        comment = f"📦 Что привезти: {delivery_item}" + (f"
-Комментарий: {comment}" if comment else "")
+        comment = f"📦 Что привезти: {delivery_item}" + (f"\nКомментарий: {comment}" if comment else "")
 
     oid = create_order(
         passenger_id=user_id, order_type=order_type,
