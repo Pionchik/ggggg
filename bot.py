@@ -60,6 +60,11 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS driver_locations (
         tg_id INTEGER PRIMARY KEY, lat REAL, lon REAL,
         updated_at TEXT DEFAULT (datetime('now')))""")
+    # Очередь рассылки заказа по водителям (геолокация)
+    c.execute("""CREATE TABLE IF NOT EXISTS order_dispatch (
+        order_id INTEGER, driver_id INTEGER, status TEXT DEFAULT 'sent',
+        sent_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (order_id, driver_id))""")
     conn.commit(); conn.close()
 
 COLS_USER  = ["id","tg_id","username","full_name","phone","role","is_banned","is_online",
@@ -196,7 +201,48 @@ def get_online_drivers_sorted(from_lat=None, from_lon=None):
     result.sort(key=lambda x: x[0])
     return [d for _, d in result]
 
-# ==================== FSM ====================
+def mark_dispatch_sent(order_id, driver_id):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO order_dispatch (order_id, driver_id, status) VALUES (?,?,'sent')",
+              (order_id, driver_id))
+    conn.commit(); conn.close()
+
+def mark_dispatch_declined(order_id, driver_id):
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE order_dispatch SET status='declined' WHERE order_id=? AND driver_id=?",
+              (order_id, driver_id))
+    conn.commit(); conn.close()
+
+def get_declined_driver_ids(order_id):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT driver_id FROM order_dispatch WHERE order_id=? AND status='declined'", (order_id,))
+    rows = c.fetchall(); conn.close()
+    return {r[0] for r in rows}
+
+def get_order_from_lat_lon(order_id):
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT lat, lon FROM order_geo WHERE order_id=?", (order_id,))
+        row = c.fetchone(); conn.close()
+        return (row[0], row[1]) if row else (None, None)
+    except:
+        return (None, None)
+
+def update_driver_rating(driver_id, stars):
+    """Обновляет рейтинг водителя с новой оценкой"""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT rating, rating_count FROM users WHERE tg_id=?", (driver_id,))
+    row = c.fetchone()
+    if row:
+        old_rating, count = row
+        new_count = count + 1
+        new_rating = ((old_rating * count) + stars) / new_count
+        c.execute("UPDATE users SET rating=?, rating_count=? WHERE tg_id=?",
+                  (round(new_rating, 2), new_count, driver_id))
+        conn.commit()
+    conn.close()
+
+
 
 class RegisterStates(StatesGroup):
     waiting_phone = State()
@@ -205,6 +251,9 @@ class AdminStates(StatesGroup):
     search_user = State()
     ban_reason  = State()
     broadcast   = State()
+
+class DriverStates(StatesGroup):
+    waiting_eta = State()   # водитель вводит через сколько минут приедет
 
 # ==================== HELPERS ====================
 
@@ -329,6 +378,19 @@ def kb_waiting_order(oid):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Отменить заказ", callback_data=f"cancel_order_{oid}", icon_custom_emoji_id="5870657884844462243")],
         [InlineKeyboardButton(text="Главное меню",   callback_data="main_menu",           icon_custom_emoji_id="5873147866364514353")],
+    ])
+
+def kb_rate_driver(driver_id, order_id):
+    """Клавиатура для оценки водителя звёздами"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⭐1", callback_data=f"rate_{order_id}_{driver_id}_1"),
+            InlineKeyboardButton(text="⭐2", callback_data=f"rate_{order_id}_{driver_id}_2"),
+            InlineKeyboardButton(text="⭐3", callback_data=f"rate_{order_id}_{driver_id}_3"),
+            InlineKeyboardButton(text="⭐4", callback_data=f"rate_{order_id}_{driver_id}_4"),
+            InlineKeyboardButton(text="⭐5", callback_data=f"rate_{order_id}_{driver_id}_5"),
+        ],
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"rate_{order_id}_{driver_id}_0", icon_custom_emoji_id="5893057118545646106")],
     ])
 
 # ==================== ROUTER ====================
@@ -569,19 +631,11 @@ async def confirm_order(callback: CallbackQuery, bot: Bot):
     icon = "📦" if order["order_type"] == "delivery" else "🚕"
     type_name = "Доставка" if order["order_type"] == "delivery" else "Такси"
 
-    # Получаем координаты точки отправления и сортируем водителей по расстоянию
-    from_lat, from_lon = None, None
-    try:
-        conn2 = db(); c2 = conn2.cursor()
-        c2.execute("SELECT lat, lon FROM order_geo WHERE order_id=?", (oid,))
-        geo_row = c2.fetchone(); conn2.close()
-        if geo_row:
-            from_lat, from_lon = geo_row
-    except: pass
+    # Координаты точки отправления
+    from_lat, from_lon = get_order_from_lat_lon(oid)
     drivers = get_online_drivers_sorted(from_lat, from_lon)
 
     if not drivers:
-        # Водителей нет — заказ остаётся в базе, ждём
         await callback.message.edit_text(
             f'{icon} <b>{type_name} #{oid} — принят!</b>\n\n'
             f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Откуда:</b> {order["from_address"]}\n'
@@ -593,7 +647,15 @@ async def confirm_order(callback: CallbackQuery, bot: Bot):
         await callback.answer()
         return
 
-    # Рассылаем заказ водителям
+    # Отправляем только БЛИЖАЙШЕМУ водителю (первый в списке)
+    first_driver = drivers[0]
+    dist_info = ""
+    if from_lat and from_lon:
+        loc = get_driver_location(first_driver["tg_id"])
+        if loc:
+            d = haversine_km(from_lat, from_lon, loc[0], loc[1])
+            dist_info = f'\n<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>До вас:</b> ~{d:.1f} км'
+
     driver_msg = (
         f'{icon} <b>Новый заказ #{oid}</b>\n\n'
         f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Откуда:</b> {order["from_address"]}\n'
@@ -601,12 +663,14 @@ async def confirm_order(callback: CallbackQuery, bot: Bot):
         f'<tg-emoji emoji-id="5778479949572738874">↔️</tg-emoji> <b>Расстояние:</b> {order["distance"]:.1f} км\n'
         f'<tg-emoji emoji-id="5904462880941545555">🪙</tg-emoji> <b>Оплата:</b> {order["price"]:.0f} ₽\n'
         f'<tg-emoji emoji-id="5870753782874246579">✍</tg-emoji> <b>Комментарий:</b> {order["comment"] or "нет"}'
+        f'{dist_info}'
     )
-    for drv in drivers:
-        try:
-            await bot.send_message(drv["tg_id"], driver_msg, parse_mode=ParseMode.HTML, reply_markup=kb_accept(oid))
-        except Exception:
-            pass
+    try:
+        await bot.send_message(first_driver["tg_id"], driver_msg,
+                               parse_mode=ParseMode.HTML, reply_markup=kb_accept(oid))
+        mark_dispatch_sent(oid, first_driver["tg_id"])
+    except Exception:
+        pass
 
     await callback.message.edit_text(
         f'{icon} <b>{type_name} #{oid} — оформлен!</b>\n\n'
@@ -655,35 +719,141 @@ async def cancel_flow(callback: CallbackQuery, state: FSMContext):
 # ===== DRIVER ACTIONS =====
 
 @router.callback_query(F.data.startswith("accept_order_"))
-async def accept_order(callback: CallbackQuery, bot: Bot):
+async def accept_order(callback: CallbackQuery, state: FSMContext, bot: Bot):
     oid = int(callback.data.split("_")[-1])
     order = get_order(oid)
     driver = get_user(callback.from_user.id)
     if not order: await callback.answer("Заказ не найден.", show_alert=True); return
     if order["status"] != "pending": await callback.answer("Заказ уже принят другим водителем.", show_alert=True); return
     if not driver or driver["role"] not in ("driver","admin"): await callback.answer("Только для водителей.", show_alert=True); return
+
+    # Резервируем заказ под этого водителя
     update_order(oid, status="accepted", driver_id=callback.from_user.id, accepted_at=datetime.now().isoformat())
-    t = eta(order["distance"])
-    try:
-        await bot.send_message(order["passenger_id"],
-            f'<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <b>Водитель найден!</b>\n\n'
-            f'<tg-emoji emoji-id="5870994129244131212">👤</tg-emoji> <b>{driver["full_name"]}</b>\n'
-            f'📱 Телефон: <b>{driver["phone"] or "не указан"}</b>\n'
-            f'<tg-emoji emoji-id="5983150113483134607">⏰</tg-emoji> Подъедет примерно через <b>{t} мин</b>',
-            parse_mode=ParseMode.HTML)
-    except Exception: pass
+
+    # Спрашиваем через сколько минут водитель будет
+    await state.set_state(DriverStates.waiting_eta)
+    await state.update_data(order_id=oid, passenger_id=order["passenger_id"])
+
     await callback.message.edit_text(
         f'<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <b>Заказ #{oid} принят!</b>\n\n'
         f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Откуда:</b> {order["from_address"]}\n'
         f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Куда:</b> {order["to_address"]}\n'
+        f'<tg-emoji emoji-id="5904462880941545555">🪙</tg-emoji> <b>Сумма:</b> {order["price"]:.0f} ₽\n\n'
+        f'<tg-emoji emoji-id="5983150113483134607">⏰</tg-emoji> <b>Через сколько минут вы будете у пассажира?</b>\n'
+        f'Напишите число (например: <b>5</b>)',
+        parse_mode=ParseMode.HTML)
+    await callback.answer("Заказ принят! Укажите время прибытия.")
+
+
+@router.message(DriverStates.waiting_eta)
+async def driver_eta_input(message: Message, state: FSMContext, bot: Bot):
+    """Водитель ввёл через сколько минут приедет"""
+    data = await state.get_data()
+    oid = data.get("order_id")
+    passenger_id = data.get("passenger_id")
+    await state.clear()
+
+    text = message.text.strip() if message.text else ""
+    try:
+        minutes = int(text)
+        if minutes < 1 or minutes > 120:
+            raise ValueError
+    except ValueError:
+        minutes = None
+
+    order = get_order(oid)
+    driver = get_user(message.from_user.id)
+    if not order or not driver:
+        return
+
+    if minutes:
+        update_order(oid, eta_minutes=minutes)
+        eta_text = f"<b>{minutes} мин</b>"
+    else:
+        minutes = eta(order["distance"])
+        eta_text = f"~{minutes} мин (расчётное)"
+
+    # Уведомляем пассажира с реальным временем от водителя
+    try:
+        await bot.send_message(
+            passenger_id,
+            f'<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <b>Водитель найден!</b>\n\n'
+            f'<tg-emoji emoji-id="5870994129244131212">👤</tg-emoji> <b>{driver["full_name"]}</b>\n'
+            f'📱 Телефон: <b>{driver["phone"] or "не указан"}</b>\n'
+            f'⭐ Рейтинг: <b>{driver["rating"]:.1f}</b>\n'
+            f'<tg-emoji emoji-id="5983150113483134607">⏰</tg-emoji> Водитель будет через {eta_text}',
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+    await message.answer(
+        f'<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <b>Пассажир уведомлён!</b>\n\n'
+        f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Откуда:</b> {order["from_address"]}\n'
+        f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Куда:</b> {order["to_address"]}\n'
         f'<tg-emoji emoji-id="5904462880941545555">🪙</tg-emoji> <b>Сумма:</b> {order["price"]:.0f} ₽',
         parse_mode=ParseMode.HTML, reply_markup=kb_driver_active(oid))
-    await callback.answer("Заказ принят!", show_alert=True)
 
 @router.callback_query(F.data.startswith("decline_order_"))
-async def decline_order(callback: CallbackQuery):
+async def decline_order(callback: CallbackQuery, bot: Bot):
+    oid = int(callback.data.split("_")[-1])
+    order = get_order(oid)
+    driver_id = callback.from_user.id
+
+    # Помечаем что этот водитель отклонил
+    mark_dispatch_declined(oid, driver_id)
     await callback.message.delete()
     await callback.answer("Заказ отклонён.")
+
+    if not order or order["status"] != "pending":
+        return  # уже принят кем-то другим
+
+    # Ищем следующего водителя (кто ещё не получал)
+    from_lat, from_lon = get_order_from_lat_lon(oid)
+    all_drivers = get_online_drivers_sorted(from_lat, from_lon)
+    declined_ids = get_declined_driver_ids(oid)
+
+    next_driver = None
+    for d in all_drivers:
+        if d["tg_id"] not in declined_ids:
+            next_driver = d
+            break
+
+    if not next_driver:
+        # Все водители отклонили — уведомим пассажира
+        try:
+            await bot.send_message(
+                order["passenger_id"],
+                f'<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> <b>Все водители отклонили заказ #{oid}.</b>\n\n'
+                f'Попробуйте оформить заказ позже.',
+                parse_mode=ParseMode.HTML, reply_markup=kb_menu())
+        except Exception:
+            pass
+        update_order(oid, status="cancelled")
+        return
+
+    icon = "📦" if order["order_type"] == "delivery" else "🚕"
+    dist_info = ""
+    if from_lat and from_lon:
+        loc = get_driver_location(next_driver["tg_id"])
+        if loc:
+            d = haversine_km(from_lat, from_lon, loc[0], loc[1])
+            dist_info = f'\n<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>До вас:</b> ~{d:.1f} км'
+
+    driver_msg = (
+        f'{icon} <b>Новый заказ #{oid}</b>\n\n'
+        f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Откуда:</b> {order["from_address"]}\n'
+        f'<tg-emoji emoji-id="6042011682497106307">📍</tg-emoji> <b>Куда:</b> {order["to_address"]}\n'
+        f'<tg-emoji emoji-id="5778479949572738874">↔️</tg-emoji> <b>Расстояние:</b> {order["distance"]:.1f} км\n'
+        f'<tg-emoji emoji-id="5904462880941545555">🪙</tg-emoji> <b>Оплата:</b> {order["price"]:.0f} ₽\n'
+        f'<tg-emoji emoji-id="5870753782874246579">✍</tg-emoji> <b>Комментарий:</b> {order["comment"] or "нет"}'
+        f'{dist_info}'
+    )
+    try:
+        await bot.send_message(next_driver["tg_id"], driver_msg,
+                               parse_mode=ParseMode.HTML, reply_markup=kb_accept(oid))
+        mark_dispatch_sent(oid, next_driver["tg_id"])
+    except Exception:
+        pass
 
 @router.callback_query(F.data.startswith("arrived_order_"))
 async def arrived_order(callback: CallbackQuery, bot: Bot):
@@ -713,8 +883,9 @@ async def complete_order(callback: CallbackQuery, bot: Bot):
         await bot.send_message(order["passenger_id"],
             f'<tg-emoji emoji-id="6041731551845159060">🎉</tg-emoji> <b>Поездка завершена!</b>\n\n'
             f'<tg-emoji emoji-id="5904462880941545555">🪙</tg-emoji> Сумма: <b>{order["price"]:.0f} ₽</b>\n\n'
-            f'Спасибо, что пользуетесь ЕнакиевоТакси!',
-            parse_mode=ParseMode.HTML, reply_markup=kb_menu())
+            f'⭐ <b>Оцените поездку — это помогает нам!</b>',
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_rate_driver(callback.from_user.id, oid))
     except Exception: pass
     await callback.message.edit_text(
         f'<tg-emoji emoji-id="6041731551845159060">🎉</tg-emoji> <b>Поездка #{oid} завершена!</b>\n\n'
@@ -738,7 +909,45 @@ async def driver_cancel(callback: CallbackQuery, bot: Bot):
         parse_mode=ParseMode.HTML, reply_markup=kb_menu())
     await callback.answer()
 
-# ===== ADMIN =====
+# ===== RATING =====
+
+@router.callback_query(F.data.startswith("rate_"))
+async def rate_driver(callback: CallbackQuery, bot: Bot):
+    """Пассажир ставит оценку водителю: rate_{order_id}_{driver_id}_{stars}"""
+    parts = callback.data.split("_")
+    # rate_{oid}_{driver_id}_{stars}
+    oid = int(parts[1])
+    driver_id = int(parts[2])
+    stars = int(parts[3])
+
+    if stars == 0:
+        user = get_user(callback.from_user.id)
+        await callback.message.edit_text(
+            f'<tg-emoji emoji-id="5873147866364514353">🏘</tg-emoji> Спасибо, что пользуетесь ЕнакиевоТакси!\n\n' + main_menu_text(user),
+            parse_mode=ParseMode.HTML, reply_markup=kb_main(user))
+        await callback.answer("Оценка пропущена.")
+        return
+
+    update_driver_rating(driver_id, stars)
+    driver = get_user(driver_id)
+    star_str = "⭐" * stars
+
+    # Уведомляем водителя об оценке
+    try:
+        await bot.send_message(
+            driver_id,
+            f'{star_str} <b>Вам поставили оценку {stars}/5!</b>\n\n'
+            f'Ваш рейтинг теперь: <b>{driver["rating"]:.1f} ⭐</b>',
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+    user = get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        f'{star_str} <b>Спасибо за оценку!</b>\n\n'
+        f'Вы оценили поездку на {stars} из 5.\n\n' + main_menu_text(user),
+        parse_mode=ParseMode.HTML, reply_markup=kb_main(user))
+    await callback.answer(f"Оценка {stars}⭐ отправлена!")
 
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
